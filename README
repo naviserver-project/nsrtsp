@@ -1,0 +1,39 @@
+RTSP streaming server for NaviServer 4.x
+Release 1.0
+vlad@crystalballinc.com
+
+This is NaviServer module that implements RTSP streaming server using
+liveMedia streaming library.
+
+/*--------------------------------------------------------------------*/
+
+
+ Configuration
+
+   nsd.tcl
+
+   ns_section    ns/servers/server/modules
+   ns_param      nsrtsp        nsrtsp.so
+
+   ns_section    ns/servers/server/module/nsrtsp
+   ns_param      port           554
+   ns_param      threads        1
+   ns_param      path           /opt/Movies
+   ns_param      path           /opt/Music
+
+
+threads - number of streaming threads to start, makes sense
+          if number of CPUs more than one. Each thread will listen
+          on different port
+
+port    - specifies port to listen for RTSP requests, in
+          case when more than 1 thread is started, each subsequent 
+          thread will listen on the next port
+
+path    - one or more paths with media to stream
+
+
+ Authors
+
+     Vlad Seryakov vlad@crystalballinc.com
+
