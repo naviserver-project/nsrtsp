@@ -12,8 +12,8 @@ MOD      =  nsrtsp.so
 #
 OBJS     = nsrtsp.o
 
-LIVE     = /usr/lib/live-media
-#LIVE      = live
+#LIVE     = /usr/lib/live-media
+LIVE      = live
 
 CFLAGS	 += -I$(LIVE)/BasicUsageEnvironment/include \
             -I$(LIVE)/UsageEnvironment/include \

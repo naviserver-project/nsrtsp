@@ -9,7 +9,7 @@
  * the License for the specific language governing rights and limitations
  * under the License.
  *
- * Copyright (C) 2001-2003 Vlad Seryakov
+ * Copyright (C) 2001-2007 Vlad Seryakov
  * All rights reserved.
  *
  * Alternatively, the contents of this file may be used under the terms
