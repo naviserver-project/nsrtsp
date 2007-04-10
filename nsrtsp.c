@@ -33,8 +33,14 @@
 
 #include "ns.h"
 #include <sys/resource.h>
+#include <sys/epoll.h>
+
 #include <BasicUsageEnvironment.hh>
 #include <liveMedia.hh>
+
+// To use this option liveMedia should be compiled with READ_FROM_FILES_SYNCHRONOUSLY
+// defined in ByteStreamFileSource.cpp, because epoll does not support disk files
+#define USE_EPOLL 1
 
 class RTSPModule;
 
@@ -59,8 +65,13 @@ protected:
 
    int fNumSockets;
    int fMaxSockets;
-   struct pollfd *fPoll;
    RTSPHandler *fHandlers;
+#ifdef USE_EPOLL
+   int fEPollSock;
+   struct epoll_event fEPoll;
+#else
+   struct pollfd *fPoll;
+#endif
 };
 
 class RTSPThread: public RTSPServer {
@@ -163,7 +174,7 @@ NS_EXPORT int Ns_ModuleInit(char *server, char *module)
     }
 
     Ns_DStringFree(&ds);
-    Ns_TclRegisterTrace(server, RTSPInterpInit, thr, NS_TCL_TRACE_CREATE);
+    Ns_TclRegisterTrace(server, RTSPInterpInit, envPtr, NS_TCL_TRACE_CREATE);
     return NS_OK;
 }
 
@@ -226,14 +237,28 @@ RTSPTaskScheduler::RTSPTaskScheduler(): fNumSockets(0)
 
     getrlimit(RLIMIT_NOFILE, &rlimit);
     fMaxSockets = rlimit.rlim_max;
-    fPoll = (struct pollfd*)ns_calloc(fMaxSockets, sizeof(struct pollfd));
+
     fHandlers = (RTSPHandler*)ns_calloc(fMaxSockets, sizeof(RTSPHandler));
+
+#ifdef USE_EPOLL
+    fEPollSock = epoll_create(fMaxSockets);
+    if (fEPollSock < 0) {
+        Ns_Log(Error, "nsrtsp: epoll_create failed: %s", strerror(errno));
+    }
+#else
+    fPoll = (struct pollfd*)ns_calloc(fMaxSockets, sizeof(struct pollfd));
+#endif
+
     Ns_Log(Notice, "nsrtsp: max number of sockets %d", fMaxSockets);
 }
 
 RTSPTaskScheduler::~RTSPTaskScheduler()
 {
+#ifdef USE_EPOLL
+    ::close(fEPollSock);
+#else
     ns_free(fPoll);
+#endif
     ns_free(fHandlers);
 }
 
@@ -249,40 +274,65 @@ void RTSPTaskScheduler::SingleStep(unsigned maxDelayTime)
         pollto = maxDelayTime/1000;
     }
 
-    for (int i = 0; i < fNumSockets; i++) {
-        fPoll[i].revents = 0;
-    }
-
     // Do the poll, ignore interruptions
     do {
-        n = ns_poll(fPoll, fNumSockets, pollto);
+#ifdef USE_EPOLL
+        n = epoll_wait(fEPollSock, &fEPoll, 1, pollto);
+#else
+        n = poll(fPoll, fNumSockets, pollto);
+#endif
     } while (n < 0  && errno == EINTR);
+
     if (n < 0) {
-        Ns_Fatal("nsrtsp: ns_poll() failed num=%d, time=%d: %s", fNumSockets, pollto, ns_sockstrerror(ns_sockerrno));
+        Ns_Fatal("nsrtsp: poll() failed num=%d, time=%d: %s", fNumSockets, pollto, ns_sockstrerror(ns_sockerrno));
     }
 
     // Handle any delayed event that may have come due
     fDelayQueue.handleAlarm();
 
     // Nothing to read from
-    if (n == 0) return;
-
-    // Go through all sockets in the loop, continue from the last processed one
-    fLastHandledSocketNum++;
-    if (fLastHandledSocketNum < 0 || fLastHandledSocketNum >= fNumSockets) {
-        fLastHandledSocketNum = 0;
+    if (n == 0) {
+        return;
     }
 
-    for (int i = fLastHandledSocketNum; i < fNumSockets; i++) {
-        if (fPoll[i].revents & POLLIN) {
-            sock = fPoll[i].fd;
-            if (fHandlers[sock].fProc != NULL) {
-                fLastHandledSocketNum = i;
-                (*fHandlers[sock].fProc)(fHandlers[sock].fData, SOCKET_READABLE);
-                break;
-            }
+#ifdef USE_EPOLL
+    if (fEPoll.events & EPOLLIN) {
+        sock = fEPoll.data.fd;
+        if (fHandlers[sock].fProc != NULL) {
+            (*fHandlers[sock].fProc)(fHandlers[sock].fData, SOCKET_READABLE);
         }
     }
+#else
+    int i, done = 0;
+
+    // Continue from the last processed socket
+    fLastHandledSocketNum++;
+
+    // Array that describes start..end for each iteration
+    int loop[5] = { fLastHandledSocketNum, fNumSockets, 0, fLastHandledSocketNum };
+
+    // Reset to start if out of range
+    if (fLastHandledSocketNum < 0 || fLastHandledSocketNum >= fNumSockets) {
+        fLastHandledSocketNum = loop[0] = loop[3] = 0;
+    }
+
+    n = 0;
+    // Scan sockets, execute one handler and clear all events in one loop
+    while (n < 3) {
+        for (i = loop[n]; i < loop[n + 1]; i++) {
+            if (!done && fPoll[i].revents & POLLIN) {
+                sock = fPoll[i].fd;
+                if (fHandlers[sock].fProc != NULL) {
+                    fLastHandledSocketNum = i;
+                    (*fHandlers[sock].fProc)(fHandlers[sock].fData, SOCKET_READABLE);
+                    done = 1;
+                }
+            }
+            fPoll[i].revents = 0;
+        }
+        n += 2;
+    }
+#endif
 }
 
 void RTSPTaskScheduler::turnOnBackgroundReadHandling(int sock, BackgroundHandlerProc *proc, void *data)
@@ -297,13 +347,22 @@ void RTSPTaskScheduler::turnOnBackgroundReadHandling(int sock, BackgroundHandler
         return;
     }
 
-    fPoll[fNumSockets].fd = sock;
-    fPoll[fNumSockets].events = POLLIN;
-
     fHandlers[sock].fIdx = fNumSockets;
     fHandlers[sock].fSock = sock;
     fHandlers[sock].fProc = proc;
     fHandlers[sock].fData = data;
+
+#ifdef USE_EPOLL
+    fEPoll.data.fd = sock;
+    fEPoll.events = EPOLLIN;
+
+    if (epoll_ctl(fEPollSock, EPOLL_CTL_ADD, sock, &fEPoll) < 0) {
+        Ns_Log(Error, "nsrtsp: turnOn: epoll failed: %d, %s", sock, ns_sockstrerror(ns_sockerrno));
+    }
+#else
+    fPoll[fNumSockets].fd = sock;
+    fPoll[fNumSockets].events = POLLIN;
+#endif
 
     fNumSockets++;
 }
@@ -311,7 +370,7 @@ void RTSPTaskScheduler::turnOnBackgroundReadHandling(int sock, BackgroundHandler
 void RTSPTaskScheduler::turnOffBackgroundReadHandling(int sock)
 {
     if (sock < 0 || sock >= fMaxSockets) {
-        Ns_Log(Error, "nsrtsp: turnOff: invalid socket %d, num=%d, max=%d", sock, fNumSockets, fMaxSockets);
+        Ns_Log(Error, "nsrtsp: turnOff: invalid socket: %d, num=%d, max=%d", sock, fNumSockets, fMaxSockets);
         return;
     }
 
@@ -320,12 +379,19 @@ void RTSPTaskScheduler::turnOffBackgroundReadHandling(int sock)
         return;
     }
 
+#ifdef USE_EPOLL
+    if (epoll_ctl(fEPollSock, EPOLL_CTL_DEL, sock, NULL) < 0) {
+        Ns_Log(Error, "nsrtsp: turnOff: epoll failed: %d, %s", sock, ns_sockstrerror(ns_sockerrno));
+    }
+#else
     // Move sockets one slot left and reassign indexes in the handlers
     for (int i = fHandlers[sock].fIdx; i < fNumSockets - 1; i++) {
         fPoll[i] = fPoll[i + 1];
         fHandlers[fPoll[i].fd].fIdx = i;
     }
     fPoll[fNumSockets].fd = 0;
+#endif
+
     fHandlers[sock].fSock = 0;
     fNumSockets--;
 }
@@ -347,7 +413,7 @@ RTSPMediaSession* RTSPMediaSession::createNew(UsageEnvironment& env, char const*
 }
 
 RTSPThread::RTSPThread(RTSPModule *envPtr, UsageEnvironment& env, int sock,  Port port):
-              RTSPServer(env, sock, port, envPtr->fAuth, envPtr->fReclaim)
+            RTSPServer(env, sock, port, envPtr->fAuth, envPtr->fReclaim)
 {
     fEnv = envPtr;
     Ns_DStringInit(&fDstr);
@@ -356,15 +422,15 @@ RTSPThread::RTSPThread(RTSPModule *envPtr, UsageEnvironment& env, int sock,  Por
     ns_sockpair(fPipe);
     this->fNext = envPtr->fThreads;
     envPtr->fThreads = this;
-    envir().taskScheduler().turnOnBackgroundReadHandling(fPipe[0], (TaskScheduler::BackgroundHandlerProc*)&pipeHandler, this);
+    envir().taskScheduler().turnOnBackgroundReadHandling(fPipe[0], &pipeHandler, this);
 }
 
 RTSPThread::~RTSPThread()
 {
     Ns_DStringFree(&fDstr);
     envir().taskScheduler().turnOffBackgroundReadHandling(fPipe[0]);
-    close(fPipe[0]);
-    close(fPipe[1]);
+    ::close(fPipe[0]);
+    ::close(fPipe[1]);
 }
 
 void RTSPThread::pipeHandler(void* arg, int mask)
