@@ -31,3 +31,7 @@ CC	 = g++
 LDSO     = g++ -shared
 
 
+live555:
+	wget -c http://www.live555.com/liveMedia/public/live555-latest.tar.gz
+	tar -xzf live555-latest.tar.gz
+	(cd live && ./genMakefiles linux-gdb && make)
