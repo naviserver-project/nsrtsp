@@ -33,6 +33,10 @@ port    - specifies port to listen for RTSP requests, in
 path    - one or more paths with media to stream
 
 
+To play with VLC
+
+  vlc rtsp://localhost:8544/fileName.mpg
+
  Authors
 
      Vlad Seryakov vlad@crystalballinc.com

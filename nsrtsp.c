@@ -40,7 +40,7 @@
 
 // To use this option liveMedia should be compiled with READ_FROM_FILES_SYNCHRONOUSLY
 // defined in ByteStreamFileSource.cpp, because epoll does not support disk files
-#define USE_EPOLL 1
+//#define USE_EPOLL 1
 
 class RTSPModule;
 
